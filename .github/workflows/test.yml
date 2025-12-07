@@ -1,5 +1,6 @@
 name: "units-test"
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches:
@@ -11,7 +12,7 @@ jobs:
   units:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v5
     - run: npm ci
     - run: npm test
 
@@ -19,15 +20,37 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        llvm-version: [13, 14]
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-15-intel]
+        # not doing 13 anymore, see Odin #4017
+        llvm-version: [17, 18]
+        build-type: [debug, release, release-native]
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v5
     - uses: ./
       with:
         llvm-version: ${{ matrix.llvm-version }}
-        cache: false
+        release: false
+        build-type: ${{ matrix.build-type }}
+    - name: Version
+      run: odin version
+    - name: Report
+      run: odin report
+    - name: Run test program
+      run: odin run test.odin -file
+
+  test-release:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-15-intel, ubuntu-24.04-arm] # ubuntu-24.04-arm should fall back to building from source.
+        release: [latest, dev-2024-05, nightly]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v5
+    - uses: ./
+      with:
+        release: ${{ matrix.release }}
+        token: ${{ secrets.GITHUB_TOKEN }}
     - name: Version
       run: odin version
     - name: Report
@@ -38,18 +61,47 @@ jobs:
   test-with-cache:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        odin-version: [master, dev-2023-08]
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-15-intel]
+        odin-version: [master]
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v5
     - uses: ./
       with:
-        odin-version: ${{ matrix.odin-version }}
-        llvm-version: 14
+        branch: ${{ matrix.odin-version }}
+        llvm-version: 17
+        release: false
+        cache: true
     - name: Version
       run: odin version
     - name: Report
       run: odin report
     - name: Run test program
       run: odin run test.odin -file
+
+  test-auxiliary:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-15-intel, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Version
+        run: odin version
+      - name: Report
+        run: odin report
+      - name: Get wasm-ld
+        run: brew install lld
+        if: ${{ matrix.os == 'macos-15-intel' || matrix.os == 'macos-latest' }}
+      - name: WASM
+        run: odin build test.odin -file -target:js_wasm32
+      - name: Get NASM
+        run: sudo apt-get install -y nasm
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+      - name: ASM
+        run: odin run test-minimal.odin -file -no-crt -default-to-nil-allocator -no-thread-local
+        # See Odin #4016
+        if: ${{ matrix.os != 'macos-15-intel' && matrix.os != 'macos-latest' }}

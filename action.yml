@@ -5,13 +5,20 @@ branding:
   color: blue
   icon: code
 inputs:
-  odin-version:
-    description: 'The Odin version to setup, supports tag names and branch names'
+  token:
+    description: 'GitHub token to make requests from, must be set to download releases'
+    required: false
+  branch:
+    description: 'The Odin branch to setup, supports tag names and branch names'
     default: 'master'
     required: true
+  release:
+    description: 'The Odin release to setup, if set, this will try to download a tagged GitHub release with this name instead of pulling/compiling, `latest` can be used to setup the latest release'
+    default: 'latest'
+    required: false
   llvm-version:
-    description: 'Which version of LLVM to install, supports 11, 12, 13 and 14, this option has no effect on Windows (14 is recommended as this is pre-installed by GitHub)'
-    default: '14'
+    description: 'Which version of LLVM to install'
+    default: '18'
     required: true
   build-type:
     description: 'Type of Odin build, supports "debug", "release" or "release_native"'
@@ -22,8 +29,8 @@ inputs:
     default: 'https://github.com/odin-lang/Odin'
     required: true
   cache:
-    description: 'Enables caching the compiler binary.'
-    default: 'true'
+    description: 'Enables caching the compiler binary, NOTE: this is probably slower than redownloading it everytime and is thus deprectated.'
+    default: 'false'
 outputs:
   cache-hit:
     description: 'A boolean value to indicate if a cache was hit'

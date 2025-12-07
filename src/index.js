@@ -2,6 +2,12 @@ const exec = require('@actions/exec');
 const core = require('@actions/core');
 const cache = require('@actions/cache');
 const io = require('@actions/io');
+const github = require('@actions/github');
+const AdmZip = require('adm-zip');
+const fs = require('fs');
+const tar = require('tar');
+const { Readable } = require('stream');
+const httpm = require('@actions/http-client');
 
 const os = require('os');
 
@@ -11,24 +17,40 @@ const common = require('./common');
 async function run() {
   try {
     const inputs = common.getInputs();
+    // const inputs = {
+    //   branch:     'master',
+    //   repository: 'github.com/odin-lang/Odin',
+    // };
 
     const odinPath = common.odinPath();
     core.addPath(odinPath);
+    if (inputs.release !== "") {
+      const releaseResult = await downloadRelease(inputs);
+      if (releaseResult.ok) {
+        await finalizeRelease(inputs);
+        core.setOutput('cache-hit', false);
+        core.saveState('cache-hit', 'false');
+        return;
+      }
+
+      if (releaseResult.fallback === false) {
+        core.setOutput('cache-hit', false);
+        core.saveState('cache-hit', 'false');
+        return;
+      }
+
+      if (typeof releaseResult.fallback === 'string') {
+        inputs.branch = releaseResult.fallback;
+      }
+    }
 
     if (common.cacheCheck(inputs)) {
-      const [cacheSuccess, ] = await Promise.all([
-        restoreCache(inputs, odinPath),
-        pullOdinBuildDependencies(inputs),
-      ]);
-
+      const [cacheSuccess, ] = await Promise.all([restoreCache(inputs, odinPath), pullOdinBuildDependencies(inputs)]);
       if (cacheSuccess) {
         return;
       }
     } else {
-      await Promise.all([
-        pullOdin(inputs.repository, inputs.odinVersion),
-        pullOdinBuildDependencies(inputs),
-      ]);
+      await Promise.all([pullOdin(inputs.repository, inputs.branch), pullOdinBuildDependencies(inputs)]);
     }
 
     core.setOutput('cache-hit', false);
@@ -72,7 +94,7 @@ async function restoreCache(inputs, odinPath) {
   if (key === restoredKey) {
     core.info('Main cache HIT, checking if it is still up-to-date');
 
-    if (await pullUpdates(odinPath, inputs.odinVersion)) {
+    if (await pullUpdates(odinPath, inputs.branch)) {
       core.info('Main cache is still up-to-date');
       core.setOutput('cache-hit', true);
       core.saveState('cache-hit', 'true');
@@ -85,7 +107,7 @@ async function restoreCache(inputs, odinPath) {
   }
   
   core.info('Main cache MISS');
-  await pullOdin(inputs.repository, inputs.odinVersion);
+  await pullOdin(inputs.repository, inputs.branch);
   return false;
 }
 
@@ -163,26 +185,52 @@ async function pullOdinBuildDependencies(inputs) {
         'install',
         `llvm@${llvm}`,
       ]);
-
+    
+      // arm64.
+      core.addPath(`/opt/homebrew/opt/llvm@${llvm}/bin`);
+      // x64.
       core.addPath(`/usr/local/opt/llvm@${llvm}/bin`);
+
       break;
   }
   case 'linux': {
       core.addPath(`/usr/lib/llvm-${llvm}/bin`);
 
-      await io.which(`llvm-${llvm}`)
-        .then(() => {
-          core.info(`LLVM ${llvm} comes pre-installed on this runner`);
-          code = 0;
-        })
-        .catch(async () => {
-          code = await exec.exec('sudo', [
-            'apt-fast',
-            'install',
-            `llvm-${llvm}-dev`,
-            `clang-${llvm}`,
-          ]);
-        });
+      const preInstalled = fs.existsSync(`/usr/lib/llvm-${llvm}/bin`);
+      if (preInstalled) {
+        core.info(`LLVM ${llvm} comes pre-installed on this runner`);
+        code = 0;
+      } else {
+        const checkCode = (message) => {
+          return async (code) => {
+            if (code !== 0) {
+              throw new Error(`${message}, code: ${code}`);
+            }
+          };
+        };
+
+        await exec.exec('sudo', ['apt-key', 'adv', '--fetch-keys', 'https://apt.llvm.org/llvm-snapshot.gpg.key'])
+          .then(checkCode('unable to retrieve llvm apt key'))
+          .then(() => exec.getExecOutput('lsb_release', ['-cs']))
+          .then(({stdout: ubuntuVersion, exitCode }) => {
+            checkCode('unable to get ubuntu version')(exitCode);
+            return ubuntuVersion.trim();
+          })
+          .then((ubuntuVersion) => exec.exec('sudo', ['apt-add-repository', `deb http://apt.llvm.org/${ubuntuVersion}/ llvm-toolchain-${ubuntuVersion}-${llvm} main`]))
+          .then(checkCode('unable to add llvm apt repository'))
+          .then(() => exec.exec('sudo', ['apt-get', 'update']))
+          .then(checkCode('unable to update apt repository'))
+          .catch((err) => { core.warning(err); });
+
+        code = await exec.exec('sudo', [
+          'apt-get',
+          'install',
+          '-y',
+          `llvm-${llvm}-dev`,
+          `clang-${llvm}`,
+        ]);
+      }
+
       break;
   }
   case 'win32':
@@ -193,6 +241,276 @@ async function pullOdinBuildDependencies(inputs) {
 
   if (code !== 0) {
     throw new Error(`Installing Odin dependencies failed with exit code: ${code}`);
+  }
+}
+
+/**
+  * @param inputs {common.Inputs}
+  *
+  * @return Promise<{ok: bool, fallback: bool|string}>
+  */
+async function downloadRelease(inputs) {
+  if (inputs.release == 'nightly') {
+    const nightlyOk = await downloadNightlyRelease(inputs);
+    return {
+      ok: nightlyOk,
+      fallback: false,
+    };
+  }
+
+  const parts = inputs.repository.split('/');
+  if (parts.length < 2) {
+    core.setFailed(`Invalid repository ${inputs.repository}.`);
+    return {
+      ok: false,
+      fallback: false,
+    };
+  }
+
+  if (inputs.token == "") {
+    core.warning('Invalid access token, falling back to git based install.');
+    return {
+      ok: false,
+      fallback: true,
+    };
+  }
+
+  const octokit = github.getOctokit(inputs.token);
+
+  const repoOpts = { repo: parts[parts.length-1], owner: parts[parts.length-2] };
+
+  let release;
+  if (inputs.release == "latest") {
+    release = await octokit.rest.repos.getLatestRelease(repoOpts);
+  } else {
+    core.info(`Looking for release tagged: ${inputs.release}`);
+    release = await octokit.rest.repos.getReleaseByTag({...repoOpts, tag: inputs.release });
+  }
+  core.debug(release);
+
+  const releaseOS = {
+    'darwin': ['macos'],
+    'linux':  ['linux', 'ubuntu'],
+    'win32':  ['windows'],
+  }[os.platform()];
+
+  const releaseArch = {
+    'x64':   'amd64',
+    'arm64': 'arm64',
+  }[os.arch()];
+
+  let asset;
+  for (const tryOS of releaseOS) {
+    const releaseAssetPrefix = `odin-${tryOS}-${releaseArch}`;
+    core.info(`Release has ${release.data.assets.length} assets, Looking for asset prefix: ${releaseAssetPrefix}`);
+
+    asset = release.data.assets.find(asset => asset.name.startsWith(releaseAssetPrefix));
+    if (asset) {
+      break;
+    }
+  }
+
+  // Releases dev-2025-10 and dev-2025-11 released arm64 based builds instead of amd64. See Odin #5845.
+  if (releaseOS.includes('macos') && releaseArch == 'amd64' && ['dev-2025-10', 'dev-2025-11'].includes(release.data.tag_name)) {
+    core.warning('this release is meant for amd64 but was built for arm64 due to a bug in Odin\'s CI, falling back to git based install.');
+    return {
+      ok: false,
+      fallback: release.data.tag_name,
+    };
+  }
+
+  if (!asset) {
+      core.warning('could not find release asset to download, falling back to git based install.');
+      return {
+        ok: false,
+        fallback: release.data.tag_name,
+      };
+  }
+
+  core.debug(asset);
+
+  // Linux/Darwin GitHub action runners come with LLVM 14 installed, we add it to path here so we can use
+  // its `wasm-ld` and other LLVM binaries that do not come with the Odin release.
+  // Because this is only really used for linking, I don't think it really matters if the versions
+  // don't match.
+  if (os.platform() == 'linux') {
+    core.addPath(`/usr/lib/llvm-18/bin`); // ubuntu-2404
+    core.addPath(`/usr/lib/llvm-14/bin`); // ubuntu-2204
+  } else if (os.platform() == 'darwin') {
+      // arm64.
+      core.addPath(`/opt/homebrew/opt/llvm@15/bin`);
+      // x64.
+      core.addPath(`/usr/local/opt/llvm@15/bin`);
+  }
+
+  core.info('Downloading release');
+
+  const download = await octokit.rest.repos.getReleaseAsset({
+    ...repoOpts,
+    asset_id: asset.id,
+    headers: {
+      'accept': 'application/octet-stream',
+    },
+  });
+
+  core.debug(download);
+
+  const extractOk = await extractDownload(download.url, Buffer.from(download.data));
+  return {
+    ok: extractOk,
+    fallback: false,
+  };
+}
+
+/**
+ *
+ * @return Promise<bool>
+ */
+async function downloadNightlyRelease() {
+  core.info('Downloading nightly release');
+
+  const http = new httpm.HttpClient('setup-odin');
+  const res = await http.get('https://odinbinaries.thisdrunkdane.io/file/odin-binaries/nightly.json');
+  if (res.message.statusCode != 200) {
+    core.error(`could not retrieve nightly releases listing, got status code: ${res.message.statusCode}.`);
+    return false;
+  }
+
+  const body = await res.readBody();
+  core.debug(body);
+  const response = JSON.parse(body);
+  const dates = Object.keys(response.files).sort();
+  const latestNightly = response.files[dates[dates.length - 1]];
+
+  const releaseOS = {
+    'darwin': 'macos',
+    'linux':  'linux',
+    'win32':  'windows',
+  }[os.platform()];
+
+  const releaseArch = {
+    'x64':   'amd64',
+    'arm64': 'arm64',
+  }[os.arch()];
+
+  const searchPrefix = `odin-${releaseOS}-${releaseArch}`;
+  const asset = latestNightly.find(asset => asset.name.startsWith(searchPrefix));
+  if (!asset) {
+    core.error(`Could not find prefix "${searchPrefix}" in asset listing: ${latestNightly.map(asset => asset.name).join(', ')}`);
+    return false;
+  }
+  core.debug(asset);
+
+  const relRes = await http.get(asset.url);
+  if (res.message.statusCode != 200) {
+    core.error(`could not retrieve nightly release, got status code: ${relRes.message.statusCode}.`);
+    return false;
+  }
+
+  return extractDownload(asset.url, await relRes.readBodyBuffer());
+}
+
+async function extractDownload(url, data) {
+  // NOTE: after dev-2024-12 non-windows releases are .tar.gz from the get go.
+  if (url.includes('.tar.gz')) {
+    core.info('Extracting tar.gz release');
+
+    fs.mkdirSync(common.odinPath());
+    await (new Promise((resolve, reject) => {
+      Readable.from(Buffer.from(data))
+        .pipe(tar.x({
+          cwd: common.odinPath(),
+          strip: 1,
+        }))
+        .on('finish', resolve)
+        .on('error', reject);
+    }));
+  } else if (url.includes('.zip')) {
+    core.info('Extracting .zip release');
+
+    const zip = new AdmZip(Buffer.from(data));
+    zip.extractAllTo(common.odinPath());
+  } else {
+    core.error(`Release download URL is not a .tar.gz or .zip`);
+    return false;
+  }
+
+  core.info('Release extracted');
+
+  // NOTE: after dev-2024-03 these releases are zipped in CI and then zipped again by GitHub.
+  // So we check and unzip again here.
+  // I know this is ugly, please do not come for me!
+  const maybeZipInZip = `${common.odinPath()}/dist.zip`;
+  if (fs.existsSync(maybeZipInZip)) {
+    core.info('Unzipping nested zip');
+    const zipInZip = new AdmZip(maybeZipInZip);
+    zipInZip.extractAllTo(common.odinPath(), false, true);
+    fs.unlinkSync(maybeZipInZip);
+  }
+
+  // NOTE: on dev-2024-11 non-windows releases are .zip with a dist.tar.gz file in them.
+  const maybeTarInZip = `${common.odinPath()}/dist.tar.gz`;
+  if (fs.existsSync(maybeTarInZip)) {
+    core.info('Extracting nested tar.gz');
+    await tar.x({
+      file: maybeTarInZip,
+      cwd: common.odinPath(),
+    });
+    fs.unlinkSync(maybeTarInZip);
+  }
+
+  // NOTE: after dev-2024-06 releases don't seem to be doubly zipped anymore
+  // but do still have the nested dist folder we need to move.
+
+  // NOTE: dev-2024-07 has 'windows_artifacts' on windows, all others have 'dist'.
+
+  let dir = fs.readdirSync(common.odinPath());
+  core.debug(dir);
+
+  // NOTE: sigh... dev-2025-02 has a random __MACOSX folder in the release?
+  dir = dir.filter(name => name !== '__MACOSX');
+
+  if (dir.length == 1) {
+    core.info('Moving dist folder');
+
+    const distDir = `${common.odinPath()}/${dir[0]}`;
+
+    // Basically does a `mv dist/* .`
+    const entries = fs.readdirSync(distDir);
+    await Promise.all(entries.map((entry) => io.mv(`${distDir}/${entry}`, `${common.odinPath()}/${entry}`)));
+  }
+
+  return true;
+}
+
+async function finalizeRelease(inputs) {
+  // NOTE: after dev-2024-03 these releases have the executable permission by default, we still 
+  // chmod to support older releases.
+  if (os.platform() == 'linux' || os.platform() == 'darwin') {
+    const code = await exec.exec(`chmod +x ${common.odinPath()}/odin`);
+    if (code != 0) {
+      core.warning(`Exit code ${code} making the compiler executable`);
+    }
+  }
+
+  if (os.platform() == 'linux') {
+    const possibleLibLLVMToRename = `${common.odinPath()}/libLLVM-18.so.1`;
+    if (fs.existsSync(possibleLibLLVMToRename)) {
+      fs.cpSync(possibleLibLLVMToRename, `${common.odinPath()}/libLLVM-18.so.18.1`);
+    }
+
+    let hasDynamicLLVM = false;
+    const dir = fs.readdirSync(common.odinPath());
+    for (const file of dir) {
+      if (file.includes("libLLVM") && file.includes(".so")) {
+        hasDynamicLLVM = true;
+        break;
+      }
+    }
+
+    if (hasDynamicLLVM) {
+      await pullOdinBuildDependencies({...inputs, llvmVersion: '18'});
+    }
   }
 }
 
